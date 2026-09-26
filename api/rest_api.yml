@@ -1,0 +1,616 @@
+openapi: 3.0.3
+
+info:
+  title: Travel Social Network API
+  description: |
+    REST API социальной сети для путешественников из курса по [System Design](https://balun.courses/).
+
+    Общие правила:
+    - Пользователь определяется по токену сессии в заголовке `Authorization`, а не по полям запроса.
+    - Неидемпотентные `POST` принимают заголовок `Idempotency-Key`: повтор с тем же ключом возвращает сохранённый ответ первого запроса.
+    - Списки пагинируются непрозрачным курсором: первый запрос без `cursor`, следующий — с `next_cursor` из ответа. `next_cursor: null` — данных больше нет.
+    - Размер страницы фиксирован на сервере: посты — 25, комментарии — 10, популярные места — 20.
+    - Фото загружаются напрямую в объектное хранилище по pre-signed URL, минуя сервера API. Ссылки на фото формирует backend по `id`.
+  version: 1.0.0
+
+servers:
+  - url: /api/v1
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Media
+    description: Загрузка фотографий
+  - name: Posts
+    description: Публикация и просмотр постов
+  - name: Comments
+    description: Комментарии к постам
+  - name: Reactions
+    description: Лайки постов
+  - name: Subscriptions
+    description: Подписки на путешественников
+  - name: Feed
+    description: Лента по подпискам
+  - name: Places
+    description: Популярные места
+
+paths:
+  /media:
+    post:
+      tags: [Media]
+      summary: Зарезервировать загрузку фотографий
+      description: |
+        Первый этап публикации поста. Сервер создаёт записи о фото и для каждой возвращает pre-signed URL.
+        Клиент загружает файл напрямую в объектное хранилище запросом `PUT upload_url`, затем передаёт
+        `media_id` в `POST /posts`.
+      operationId: createMedia
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMediaRequest'
+      responses:
+        '201':
+          description: Загрузка зарезервирована
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMediaResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /posts:
+    post:
+      tags: [Posts]
+      summary: Опубликовать пост
+      description: Второй этап публикации поста. Все `media_ids` должны быть загружены текущим пользователем.
+      operationId: createPost
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePostRequest'
+      responses:
+        '201':
+          description: Пост опубликован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Post'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '422':
+          description: Фото не найдено, ещё не загружено или принадлежит другому пользователю
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Posts]
+      summary: Посты путешественника и/или места
+      description: |
+        Посты в обратном хронологическом порядке, 25 на страницу.
+        Фильтры объединяются через AND. Нужен хотя бы один фильтр, иначе `400`.
+      operationId: listPosts
+      parameters:
+        - name: user_id
+          in: query
+          description: Автор постов
+          schema:
+            type: string
+            format: uuid
+        - name: location_ids
+          in: query
+          description: Места, к которым привязаны посты
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница постов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /posts/{post_id}:
+    get:
+      tags: [Posts]
+      summary: Пост с первыми комментариями
+      description: Возвращает пост, 10 самых новых комментариев и курсор для `GET /posts/{post_id}/comments`.
+      operationId: getPost
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      responses:
+        '200':
+          description: Пост
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /posts/{post_id}/comments:
+    get:
+      tags: [Comments]
+      summary: Комментарии к посту
+      description: Комментарии от новых к старым, 10 на страницу.
+      operationId: listComments
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница комментариев
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Comments]
+      summary: Оставить комментарий
+      operationId: createComment
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentRequest'
+      responses:
+        '201':
+          description: Комментарий создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /posts/{post_id}/like:
+    put:
+      tags: [Reactions]
+      summary: Лайкнуть пост
+      description: Идемпотентно. Повторный лайк ничего не меняет и тоже возвращает `204`. Снять лайк нельзя.
+      operationId: likePost
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      responses:
+        '204':
+          description: Лайк стоит
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /subscriptions/{followee_id}:
+    parameters:
+      - name: followee_id
+        in: path
+        required: true
+        description: Путешественник, на которого подписывается текущий пользователь
+        schema:
+          type: string
+          format: uuid
+    put:
+      tags: [Subscriptions]
+      summary: Подписаться
+      description: Идемпотентно. Повторная подписка ничего не меняет и тоже возвращает `204`.
+      operationId: subscribe
+      responses:
+        '204':
+          description: Подписка оформлена
+        '400':
+          description: Нельзя подписаться на самого себя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [Subscriptions]
+      summary: Отписаться
+      description: Идемпотентно. Если подписки не было, тоже возвращает `204`.
+      operationId: unsubscribe
+      responses:
+        '204':
+          description: Подписки нет
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /feed:
+    get:
+      tags: [Feed]
+      summary: Лента по подпискам
+      description: |
+        Посты путешественников, на которых подписан текущий пользователь, в обратном хронологическом порядке, 25 на страницу.
+        Без `cursor` возвращается свежая первая страница (pull-to-refresh), с `cursor` — продолжение прокрутки.
+      operationId: getFeed
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница ленты
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /places/popular:
+    get:
+      tags: [Places]
+      summary: Популярные места
+      description: Топ-20 мест по популярности, без пагинации. Посты места — `GET /posts?location_ids={id}`.
+      operationId: listPopularPlaces
+      parameters:
+        - name: country
+          in: query
+          description: Код страны
+          schema:
+            type: string
+          example: GE
+        - name: city
+          in: query
+          schema:
+            type: string
+          example: Тбилиси
+      responses:
+        '200':
+          description: Популярные места
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Токен сессии
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Генерируется клиентом на одно действие пользователя.
+        Повтор с тем же ключом возвращает сохранённый ответ первого запроса, операция повторно не выполняется.
+      schema:
+        type: string
+        format: uuid
+      example: 7356bc5e-21c1-4fda-a790-2811b353bbc9
+    Cursor:
+      name: cursor
+      in: query
+      description: Непрозрачный курсор из `next_cursor` предыдущего ответа. В первом запросе не передаётся.
+      schema:
+        type: string
+      example: eyJjcmVhdGVkX2F0IjoiMjAyNi0wOS0yNlQxMjowNTowMFoiLCJpZCI6Ijc3In0
+    PostId:
+      name: post_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Нет валидного токена сессии
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    IdempotencyConflict:
+      description: Этот `Idempotency-Key` уже использован с другим телом запроса
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          description: Через сколько секунд можно повторить запрос
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    CreateMediaRequest:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            type: object
+            required: [content_type]
+            properties:
+              content_type:
+                type: string
+                pattern: '^image/'
+                example: image/jpeg
+
+    CreateMediaResponse:
+      type: object
+      required: [media]
+      properties:
+        media:
+          type: array
+          items:
+            type: object
+            required: [media_id, upload_url, expires_at]
+            properties:
+              media_id:
+                type: string
+                format: uuid
+              upload_url:
+                type: string
+                format: uri
+                description: Pre-signed URL для `PUT` файла в объектное хранилище
+                example: https://storage.example.com/photos/3f1c...?X-Signature=...
+              expires_at:
+                type: string
+                format: date-time
+                description: До какого момента действует `upload_url`
+
+    CreatePostRequest:
+      type: object
+      required: [location_id, media_ids, text]
+      properties:
+        location_id:
+          type: string
+          format: uuid
+        media_ids:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        text:
+          type: string
+          maxLength: 500
+          example: Рассвет над Казбеги
+
+    CreateCommentRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 250
+          example: Какой вид! Сколько шли до смотровой?
+
+    Media:
+      type: object
+      required: [id, preview_url, url]
+      properties:
+        id:
+          type: string
+          format: uuid
+        preview_url:
+          type: string
+          format: uri
+          description: Превью (~150 KB) для ленты
+        url:
+          type: string
+          format: uri
+          description: Оригинал (~2 MB)
+
+    Post:
+      type: object
+      required: [id, author_id, location_id, text, media, likes_count, comments_count, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        author_id:
+          type: string
+          format: uuid
+        location_id:
+          type: string
+          format: uuid
+        text:
+          type: string
+          maxLength: 500
+        media:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Media'
+        likes_count:
+          type: integer
+          format: int64
+          minimum: 0
+        comments_count:
+          type: integer
+          format: int64
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+
+    PostDetails:
+      allOf:
+        - $ref: '#/components/schemas/Post'
+        - type: object
+          required: [comments, comments_next_cursor]
+          properties:
+            comments:
+              type: array
+              maxItems: 10
+              items:
+                $ref: '#/components/schemas/Comment'
+            comments_next_cursor:
+              type: string
+              nullable: true
+              description: Курсор для `GET /posts/{post_id}/comments`. `null` — комментариев больше нет.
+
+    PostPage:
+      type: object
+      required: [posts, next_cursor]
+      properties:
+        posts:
+          type: array
+          maxItems: 25
+          items:
+            $ref: '#/components/schemas/Post'
+        next_cursor:
+          type: string
+          nullable: true
+
+    Comment:
+      type: object
+      required: [id, post_id, author_id, text, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        post_id:
+          type: string
+          format: uuid
+        author_id:
+          type: string
+          format: uuid
+        text:
+          type: string
+          maxLength: 250
+        created_at:
+          type: string
+          format: date-time
+
+    CommentPage:
+      type: object
+      required: [comments, next_cursor]
+      properties:
+        comments:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/Comment'
+        next_cursor:
+          type: string
+          nullable: true
+
+    Place:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Гергетская Троица
+        country:
+          type: string
+          example: GE
+        city:
+          type: string
+          example: Степанцминда
+
+    PlaceList:
+      type: object
+      required: [places]
+      properties:
+        places:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/Place'
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: validation_error
+        message:
+          type: string
+          example: text is longer than 500 characters
